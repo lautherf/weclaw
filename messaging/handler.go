@@ -1,11 +1,13 @@
 package messaging
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -39,9 +41,10 @@ type Handler struct {
 	customAliases map[string]string      // custom alias -> agent name (from config)
 	factory       AgentFactory
 	saveDefault   SaveDefaultFunc
-	contextTokens sync.Map   // map[userID]contextToken
-	saveDir       string     // directory to save images/files to
-	seenMsgs      sync.Map   // map[int64]time.Time — dedup by message_id
+	contextTokens   sync.Map   // map[userID]contextToken
+	saveDir         string     // directory to save images/files to
+	seenMsgs        sync.Map   // map[int64]time.Time — dedup by message_id
+	logFilePath     string     // path to weclaw.log for /log command
 }
 
 // NewHandler creates a new message handler.
@@ -57,6 +60,11 @@ func NewHandler(factory AgentFactory, saveDefault SaveDefaultFunc) *Handler {
 // SetSaveDir sets the directory for saving images and files.
 func (h *Handler) SetSaveDir(dir string) {
 	h.saveDir = dir
+}
+
+// SetLogFile sets the path to the weclaw log file for the /log command.
+func (h *Handler) SetLogFile(path string) {
+	h.logFilePath = path
 }
 
 // cleanSeenMsgs removes entries older than 5 minutes from the dedup cache.
@@ -345,6 +353,18 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 		return
 	} else if strings.HasPrefix(trimmed, "/cwd") {
 		reply := h.handleCwd(trimmed)
+		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
+			log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
+		}
+		return
+	} else if strings.HasPrefix(trimmed, "/log") {
+		reply := h.handleLog(trimmed)
+		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
+			log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
+		}
+		return
+	} else if strings.HasPrefix(trimmed, "/ls") {
+		reply := h.handleLs(trimmed)
 		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
 			log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
 		}
@@ -665,6 +685,125 @@ func (h *Handler) handleCwd(trimmed string) string {
 	return fmt.Sprintf("cwd: %s", absPath)
 }
 
+// handleLog handles the /log command — returns the last N lines from the log file.
+func (h *Handler) handleLog(trimmed string) string {
+	n := 20
+	arg := strings.TrimSpace(strings.TrimPrefix(trimmed, "/log"))
+	if arg != "" {
+		if parsed, err := strconv.Atoi(arg); err == nil && parsed > 0 {
+			n = parsed
+		}
+	}
+	if n > 200 {
+		n = 200
+	}
+
+	if h.logFilePath == "" {
+		return "log file not configured"
+	}
+
+	f, err := os.Open(h.logFilePath)
+	if err != nil {
+		return fmt.Sprintf("open log file: %v", err)
+	}
+	defer f.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Sprintf("read log file: %v", err)
+	}
+
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+
+	return fmt.Sprintf("```\n%s\n```", strings.Join(lines, "\n"))
+}
+
+// handleLs handles the /ls command — lists files and directories at a given path with depth control.
+func (h *Handler) handleLs(trimmed string) string {
+	parts := strings.Fields(strings.TrimSpace(strings.TrimPrefix(trimmed, "/ls")))
+
+	root := "."
+	maxDepth := 1
+
+	if len(parts) > 0 && parts[0] != "" {
+		root = parts[0]
+	}
+	if len(parts) > 1 {
+		if d, err := strconv.Atoi(parts[1]); err == nil && d > 0 {
+			maxDepth = d
+		}
+	}
+	if maxDepth > 5 {
+		maxDepth = 5
+	}
+
+	// Expand ~
+	if root == "~" {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			root = home
+		}
+	} else if strings.HasPrefix(root, "~/") {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			root = filepath.Join(home, root[2:])
+		}
+	}
+
+	absPath, err := filepath.Abs(root)
+	if err != nil {
+		return fmt.Sprintf("invalid path: %v", err)
+	}
+
+	info, err := os.Stat(absPath)
+	if err != nil {
+		return fmt.Sprintf("path not found: %s", absPath)
+	}
+	if !info.IsDir() {
+		return fmt.Sprintf("not a directory: %s", absPath)
+	}
+
+	var buf strings.Builder
+	n := 1
+	walkDirFlat(&buf, absPath, maxDepth, 0, &n)
+
+	out := strings.TrimSpace(buf.String())
+	if out == "" {
+		return "(empty)"
+	}
+	return out
+}
+
+// walkDirFlat recursively walks a directory and writes full paths one per line.
+func walkDirFlat(buf *strings.Builder, path string, maxDepth, currentDepth int, n *int) {
+	if currentDepth >= maxDepth {
+		return
+	}
+
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return
+	}
+
+	for _, entry := range entries {
+		fullPath := filepath.Join(path, entry.Name())
+		if entry.IsDir() {
+			buf.WriteString(fmt.Sprintf("%d. %s/\n", *n, fullPath))
+			*n++
+			walkDirFlat(buf, fullPath, maxDepth, currentDepth+1, n)
+		} else {
+			buf.WriteString(fmt.Sprintf("%d. %s\n", *n, fullPath))
+			*n++
+		}
+	}
+}
+
 // buildStatus returns a short status string showing the current default agent.
 func (h *Handler) buildStatus() string {
 	h.mu.RLock()
@@ -690,6 +829,8 @@ func buildHelpText() string {
 @a @b msg - Broadcast to multiple agents
 /new or /clear - Start a new session
 /cwd /path - Switch workspace directory
+/log [N] - Show last N lines of log (default 20)
+/ls [path] [depth] - List files and folders (default depth 1, max 5)
 /info - Show current agent info
 /help - Show this help message
 

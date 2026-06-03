@@ -138,6 +138,9 @@ func runStart(cmd *cobra.Command, args []string) error {
 		log.Printf("Image save directory: %s", cfg.SaveDir)
 	}
 
+	// Set log file path for /log command
+	handler.SetLogFile(logFile())
+
 	// Start default agent initialization in background so monitors can start immediately
 	go func() {
 		if cfg.DefaultAgent == "" {
