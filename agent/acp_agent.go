@@ -358,6 +358,17 @@ func (a *ACPAgent) ResetSession(ctx context.Context, conversationID string) (str
 	return sessionID, nil
 }
 
+// GetSessionID returns the current session ID for the given conversationID.
+func (a *ACPAgent) GetSessionID(conversationID string) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.protocol == protocolCodexAppServer {
+		return a.threads[conversationID]
+	}
+	return a.sessions[conversationID]
+}
+
 // Chat sends a message and returns the full response.
 func (a *ACPAgent) Chat(ctx context.Context, conversationID string, message string) (string, error) {
 	if !a.started {

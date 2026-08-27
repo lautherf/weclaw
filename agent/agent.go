@@ -87,6 +87,10 @@ type Agent interface {
 	// (CLI mode) or is not applicable (HTTP mode).
 	ResetSession(ctx context.Context, conversationID string) (string, error)
 
+	// GetSessionID returns the current session ID for the given conversationID.
+	// Returns empty string if no session exists or is not applicable.
+	GetSessionID(conversationID string) string
+
 	// Info returns metadata about this agent.
 	Info() AgentInfo
 

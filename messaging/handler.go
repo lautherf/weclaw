@@ -3,10 +3,15 @@ package messaging
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -365,6 +370,12 @@ func (h *Handler) HandleMessage(ctx context.Context, client *ilink.Client, msg i
 		return
 	} else if strings.HasPrefix(trimmed, "/ls") {
 		reply := h.handleLs(trimmed)
+		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
+			log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
+		}
+		return
+	} else if strings.HasPrefix(trimmed, "/session") {
+		reply := h.handleSession(trimmed, msg.FromUserID)
 		if err := SendTextReply(ctx, client, msg.FromUserID, reply, msg.ContextToken, clientID); err != nil {
 			log.Printf("[handler] failed to send reply to %s: %v", msg.FromUserID, err)
 		}
@@ -780,6 +791,385 @@ func (h *Handler) handleLs(trimmed string) string {
 	return out
 }
 
+// handleSession handles the /session command — manages opencode sessions.
+func (h *Handler) handleSession(trimmed string, userID string) string {
+	arg := strings.TrimSpace(strings.TrimPrefix(trimmed, "/session"))
+
+	// No argument: show current session ID
+	if arg == "" {
+		return h.getCurrentSessionID(userID)
+	}
+
+	// Find opencode binary
+	opencodePath, err := findOpencodeBinary()
+	if err != nil {
+		return "opencode 未安装或不在 PATH 中"
+	}
+
+	if arg == "list" {
+		return listOpencodeSessions(opencodePath)
+	}
+
+	if strings.HasPrefix(arg, "delete ") || strings.HasPrefix(arg, "del ") {
+		sessionID := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(arg, "delete "), "del "))
+		if sessionID == "" {
+			return "用法: /session delete <sessionID>"
+		}
+		return deleteOpencodeSession(opencodePath, sessionID)
+	}
+
+	if strings.HasPrefix(arg, "fork ") {
+		sessionID := strings.TrimSpace(strings.TrimPrefix(arg, "fork "))
+		if sessionID == "" {
+			return "用法: /session fork <sessionID>"
+		}
+		return forkOpencodeSession(opencodePath, sessionID)
+	}
+
+	if strings.HasPrefix(arg, "rename ") {
+		parts := strings.SplitN(strings.TrimPrefix(arg, "rename "), " ", 2)
+		if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+			return "用法: /session rename <sessionID> <新标题>"
+		}
+		return renameOpencodeSession(opencodePath, parts[0], parts[1])
+	}
+
+	return "用法:\n/session - 查看当前会话 ID\n/session list - 列出所有会话\n/session delete <id> - 删除会话\n/session fork <id> - 分叉会话（显示最近对话）\n/session rename <id> <标题> - 重命名会话（显示最近对话）"
+}
+
+// getCurrentSessionID returns the current session ID for the user.
+func (h *Handler) getCurrentSessionID(userID string) string {
+	ag := h.getDefaultAgent()
+	if ag == nil {
+		return "没有运行中的 Agent"
+	}
+
+	sessionID := ag.GetSessionID(userID)
+	if sessionID == "" {
+		return "当前会话尚未创建。发送消息后会自动创建。"
+	}
+
+	info := ag.Info()
+	return fmt.Sprintf("当前会话:\nAgent: %s\n会话 ID: %s\n(完整 ID 可用于 fork/rename)", info.Name, sessionID)
+}
+
+// findOpencodeBinary finds the opencode binary in PATH.
+func findOpencodeBinary() (string, error) {
+	if p, err := exec.LookPath("opencode"); err == nil {
+		return p, nil
+	}
+	// Fallback: try login shell
+	shell := "zsh"
+	if runtime.GOOS != "darwin" {
+		shell = "bash"
+	}
+	out, err := exec.Command(shell, "-lic", "which opencode").Output()
+	if err != nil {
+		return "", fmt.Errorf("opencode not found")
+	}
+	p := strings.TrimSpace(string(out))
+	if p == "" {
+		return "", fmt.Errorf("opencode not found")
+	}
+	return p, nil
+}
+
+// listOpencodeSessions runs `opencode session list` and returns formatted output.
+func listOpencodeSessions(opencodePath string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, opencodePath, "session", "list", "--format", "json")
+	out, err := cmd.Output()
+	if err != nil {
+		return fmt.Sprintf("获取会话列表失败: %v", err)
+	}
+
+	var sessions []struct {
+		ID        string `json:"id"`
+		Title     string `json:"title"`
+		CreatedAt string `json:"createdAt"`
+		UpdatedAt string `json:"updatedAt"`
+	}
+	if err := json.Unmarshal(out, &sessions); err != nil {
+		// Fallback: return raw output
+		output := strings.TrimSpace(string(out))
+		if output == "" {
+			return "没有会话"
+		}
+		return output
+	}
+
+	if len(sessions) == 0 {
+		return "没有会话"
+	}
+
+	var buf strings.Builder
+	buf.WriteString("会话列表:\n")
+	for i, s := range sessions {
+		if i >= 20 {
+			buf.WriteString(fmt.Sprintf("... 还有 %d 个会话\n", len(sessions)-20))
+			break
+		}
+		title := s.Title
+		if title == "" {
+			title = "(无标题)"
+		}
+		// Truncate long titles
+		if len(title) > 30 {
+			title = title[:27] + "..."
+		}
+		buf.WriteString(fmt.Sprintf("%s - %s\n", s.ID[:8], title))
+	}
+	return buf.String()
+}
+
+// deleteOpencodeSession runs `opencode session delete <id>`.
+func deleteOpencodeSession(opencodePath, sessionID string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, opencodePath, "session", "delete", sessionID)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Sprintf("删除会话失败: %v\n%s", err, strings.TrimSpace(string(out)))
+	}
+	return fmt.Sprintf("已删除会话 %s", sessionID)
+}
+
+// forkOpencodeSession forks an existing session via the OpenCode server API.
+func forkOpencodeSession(opencodePath, sessionID string) string {
+	serverURL := findOpencodeServer()
+	if serverURL == "" {
+		// Fallback: try using CLI with run command
+		return forkOpencodeSessionCLI(opencodePath, sessionID)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	body := `{}`
+	req, err := http.NewRequestWithContext(ctx, "POST", serverURL+"/session/"+sessionID+"/fork", strings.NewReader(body))
+	if err != nil {
+		return fmt.Sprintf("创建请求失败: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Sprintf("分叉会话失败: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Sprintf("分叉会话失败 (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+
+	var session struct {
+		ID    string `json:"id"`
+		Title string `json:"title"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&session); err != nil {
+		return "已分叉会话（无法获取新会话信息）"
+	}
+
+	title := session.Title
+	if title == "" {
+		title = "(无标题)"
+	}
+
+	result := fmt.Sprintf("已分叉会话\n新会话: %s\n标题: %s", session.ID[:8], title)
+
+	// Get last 5 messages from the new session
+	if history := getSessionHistory(opencodePath, session.ID, 5); history != "" {
+		result += "\n\n" + history
+	}
+
+	return result
+}
+
+// forkOpencodeSessionCLI forks a session using the opencode run command.
+func forkOpencodeSessionCLI(opencodePath, sessionID string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Use run command with --session and --fork flags
+	cmd := exec.CommandContext(ctx, opencodePath, "run", "--session", sessionID, "--fork", "--format", "json", "")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Sprintf("分叉会话失败: %v\n%s", err, strings.TrimSpace(string(out)))
+	}
+
+	// Parse the output to get the new session ID
+	var result struct {
+		SessionID string `json:"sessionID"`
+	}
+	if err := json.Unmarshal(out, &result); err == nil && result.SessionID != "" {
+		reply := fmt.Sprintf("已分叉会话\n新会话: %s", result.SessionID[:8])
+
+		// Get last 5 messages from the new session
+		if history := getSessionHistory(opencodePath, result.SessionID, 5); history != "" {
+			reply += "\n\n" + history
+		}
+
+		return reply
+	}
+
+	return "已分叉会话"
+}
+
+// renameOpencodeSession renames a session via the OpenCode server API.
+func renameOpencodeSession(opencodePath, sessionID, newTitle string) string {
+	serverURL := findOpencodeServer()
+	if serverURL == "" {
+		return "OpenCode 服务器未运行。请先启动: opencode serve"
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	body := fmt.Sprintf(`{"title": %s}`, jsonEscapeString(newTitle))
+	req, err := http.NewRequestWithContext(ctx, "PATCH", serverURL+"/session/"+sessionID, strings.NewReader(body))
+	if err != nil {
+		return fmt.Sprintf("创建请求失败: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Sprintf("重命名会话失败: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Sprintf("重命名会话失败 (HTTP %d): %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+
+	result := fmt.Sprintf("已将会话 %s 重命名为: %s", sessionID[:8], newTitle)
+
+	// Get last 5 messages from the session
+	if history := getSessionHistory(opencodePath, sessionID, 5); history != "" {
+		result += "\n\n" + history
+	}
+
+	return result
+}
+
+// jsonEscapeString escapes a string for use in JSON.
+func jsonEscapeString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+// getSessionHistory returns the last N messages from a session.
+func getSessionHistory(opencodePath, sessionID string, maxMessages int) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, opencodePath, "export", sessionID)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	// Parse the export output - skip the first line "Exporting session: ..."
+	lines := strings.SplitN(string(out), "\n", 2)
+	if len(lines) < 2 {
+		return ""
+	}
+
+	var export struct {
+		Messages []struct {
+			Info struct {
+				Role string `json:"role"`
+			} `json:"info"`
+			Parts []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"parts"`
+		} `json:"messages"`
+	}
+
+	if err := json.Unmarshal([]byte(lines[1]), &export); err != nil {
+		return ""
+	}
+
+	if len(export.Messages) == 0 {
+		return ""
+	}
+
+	// Get the last N messages
+	start := 0
+	if len(export.Messages) > maxMessages {
+		start = len(export.Messages) - maxMessages
+	}
+	recentMessages := export.Messages[start:]
+
+	var buf strings.Builder
+	buf.WriteString("最近对话:\n")
+
+	for _, msg := range recentMessages {
+		role := msg.Info.Role
+		if role == "user" {
+			// Extract text from parts
+			for _, part := range msg.Parts {
+				if part.Type == "text" && part.Text != "" {
+					text := part.Text
+					if len(text) > 50 {
+						text = text[:47] + "..."
+					}
+					buf.WriteString(fmt.Sprintf("用户: %s\n", text))
+					break
+				}
+			}
+		} else if role == "assistant" {
+			// Extract text from parts
+			for _, part := range msg.Parts {
+				if part.Type == "text" && part.Text != "" {
+					text := part.Text
+					if len(text) > 100 {
+						text = text[:97] + "..."
+					}
+					buf.WriteString(fmt.Sprintf("助手: %s\n", text))
+					break
+				}
+			}
+		}
+	}
+
+	return buf.String()
+}
+
+// findOpencodeServer finds a running OpenCode server.
+// Returns the base URL (e.g., "http://127.0.0.1:4096") or empty string.
+func findOpencodeServer() string {
+	// Try default port first
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://127.0.0.1:4096/global/health")
+	if err == nil {
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			return "http://127.0.0.1:4096"
+		}
+	}
+
+	// Try common alternative ports
+	for _, port := range []int{4097, 4098, 4099, 8080, 8081} {
+		url := fmt.Sprintf("http://127.0.0.1:%d/global/health", port)
+		resp, err := client.Get(url)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return fmt.Sprintf("http://127.0.0.1:%d", port)
+			}
+		}
+	}
+
+	return ""
+}
+
 // walkDirFlat recursively walks a directory and writes full paths one per line.
 func walkDirFlat(buf *strings.Builder, path string, maxDepth, currentDepth int, n *int) {
 	if currentDepth >= maxDepth {
@@ -823,18 +1213,42 @@ func (h *Handler) buildStatus() string {
 }
 
 func buildHelpText() string {
-	return `Available commands:
-@agent or /agent - Switch default agent
-@agent msg or /agent msg - Send to a specific agent
-@a @b msg - Broadcast to multiple agents
-/new or /clear - Start a new session
-/cwd /path - Switch workspace directory
-/log [N] - Show last N lines of log (default 20)
-/ls [path] [depth] - List files and folders (default depth 1, max 5)
-/info - Show current agent info
-/help - Show this help message
+	return `WeClaw 命令列表
 
-Aliases: /cc(claude) /cx(codex) /cs(cursor) /km(kimi) /gm(gemini) /oc(openclaw) /ocd(opencode) /pi(pi) /cp(copilot) /dr(droid) /if(iflow) /kr(kiro) /qw(qwen)`
+对话
+  直接发文字       发送给默认 Agent
+  /agent msg       发送给指定 Agent
+  @agent msg       同上
+  @a @b msg        同时发给多个 Agent
+
+切换
+  /agent           切换默认 Agent
+  /cc              切换到 Claude
+  /cx              切换到 Codex
+  /cs              切换到 Cursor
+  /km              切换到 Kimi
+  /gm              切换到 Gemini
+  /ocd             切换到 OpenCode
+  /oc              切换到 OpenClaw
+  /pi              切换到 Pi
+  /cp              切换到 Copilot
+
+会话
+  /new             开始新对话
+  /clear           同上
+  /session list    列出 OpenCode 会话
+  /session delete <id>  删除 OpenCode 会话
+  /session fork <id>    分叉 OpenCode 会话
+  /session rename <id> <标题>  重命名 OpenCode 会话
+
+工作目录
+  /cwd /path       切换工作目录
+
+系统
+  /info            查看当前 Agent 信息
+  /log [N]         查看最近日志（默认 20 行，最大 200）
+  /ls [path] [d]   列出文件（默认深度 1，最大 5）
+  /help            显示此帮助`
 }
 
 func extractText(msg ilink.WeixinMessage) string {

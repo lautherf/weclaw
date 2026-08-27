@@ -137,4 +137,7 @@ func TestBuildHelpText(t *testing.T) {
 	if !strings.Contains(text, "/help") {
 		t.Error("help text should mention /help")
 	}
+	if !strings.Contains(text, "/session") {
+		t.Error("help text should mention /session")
+	}
 }

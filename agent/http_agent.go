@@ -82,6 +82,11 @@ func (a *HTTPAgent) ResetSession(_ context.Context, conversationID string) (stri
 	return "", nil
 }
 
+// GetSessionID returns empty string for HTTP agents (no server-side session).
+func (a *HTTPAgent) GetSessionID(_ string) string {
+	return ""
+}
+
 // Chat sends a message to the OpenAI-compatible API and returns the response.
 func (a *HTTPAgent) Chat(ctx context.Context, conversationID string, message string) (string, error) {
 	a.mu.Lock()

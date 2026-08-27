@@ -95,6 +95,13 @@ func (a *CLIAgent) ResetSession(_ context.Context, conversationID string) (strin
 	return "", nil
 }
 
+// GetSessionID returns the current session ID for the given conversationID.
+func (a *CLIAgent) GetSessionID(conversationID string) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.sessions[conversationID]
+}
+
 // SetCwd changes the working directory for subsequent CLI invocations.
 func (a *CLIAgent) SetCwd(cwd string) {
 	a.mu.Lock()
